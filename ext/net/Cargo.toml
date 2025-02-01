@@ -1,23 +1,32 @@
-# Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+# Copyright 2018-2025 the Deno authors. MIT license.
 
 [package]
 name = "deno_net"
-version = "0.18.0"
-authors = ["the Deno authors"]
-edition = "2021"
-license = "MIT"
+version = "0.181.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 readme = "README.md"
-repository = "https://github.com/denoland/deno"
+repository.workspace = true
 description = "Networking for Deno"
 
 [lib]
 path = "lib.rs"
 
 [dependencies]
-deno_core = { version = "0.108.0", path = "../../core" }
-deno_tls = { version = "0.13.0", path = "../tls" }
-log = "0.4.14"
-serde = { version = "1.0.129", features = ["derive"] }
-tokio = { version = "1.10.1", features = ["full"] }
-trust-dns-proto = "0.20.3"
-trust-dns-resolver = { version = "0.20.3", features = ["tokio-runtime", "serde-config"] }
+deno_core.workspace = true
+deno_error.workspace = true
+deno_permissions.workspace = true
+deno_tls.workspace = true
+hickory-proto = "0.25.0-alpha.4"
+hickory-resolver.workspace = true
+pin-project.workspace = true
+quinn = { version = "0.11.6", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rustls-tokio-stream.workspace = true
+serde.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+web-transport-proto = "0.2.3"

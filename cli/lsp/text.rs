@@ -1,19 +1,16 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_core::error::custom_error;
+use std::collections::HashMap;
+
 use deno_core::error::AnyError;
-use deno_core::serde_json::json;
-use deno_core::serde_json::Value;
+use deno_error::JsErrorBox;
 use dissimilar::diff;
 use dissimilar::Chunk;
-use lspower::jsonrpc;
-use lspower::lsp;
-use lspower::lsp::TextEdit;
-use std::collections::HashMap;
-use std::ops::Bound;
-use std::ops::RangeBounds;
 use text_size::TextRange;
 use text_size::TextSize;
+use tower_lsp::jsonrpc;
+use tower_lsp::lsp_types as lsp;
+use tower_lsp::lsp_types::TextEdit;
 
 fn partition_point<T, P>(slice: &[T], mut predicate: P) -> usize
 where
@@ -140,7 +137,7 @@ impl LineIndex {
     if let Some(line_offset) = self.utf8_offsets.get(position.line as usize) {
       Ok(line_offset + col)
     } else {
-      Err(custom_error("OutOfRange", "The position is out of range."))
+      Err(JsErrorBox::new("OutOfRange", "The position is out of range.").into())
     }
   }
 
@@ -160,7 +157,7 @@ impl LineIndex {
     if let Some(line_offset) = self.utf16_offsets.get(position.line as usize) {
       Ok(line_offset + TextSize::from(position.character))
     } else {
-      Err(custom_error("OutOfRange", "The position is out of range."))
+      Err(JsErrorBox::new("OutOfRange", "The position is out of range.").into())
     }
   }
 
@@ -189,6 +186,10 @@ impl LineIndex {
     }
   }
 
+  pub fn line_length_utf16(&self, line: u32) -> TextSize {
+    self.utf16_offsets[(line + 1) as usize] - self.utf16_offsets[line as usize]
+  }
+
   pub fn text_content_length_utf16(&self) -> TextSize {
     *self.utf16_offsets.last().unwrap()
   }
@@ -213,6 +214,18 @@ impl LineIndex {
 pub fn get_edits(a: &str, b: &str, line_index: &LineIndex) -> Vec<TextEdit> {
   if a == b {
     return vec![];
+  }
+  // Heuristic to detect things like minified files. `diff()` is expensive.
+  if b.chars().filter(|c| *c == '\n').count()
+    > line_index.utf8_offsets.len() * 3
+  {
+    return vec![TextEdit {
+      range: lsp::Range {
+        start: lsp::Position::new(0, 0),
+        end: line_index.position_utf16(TextSize::from(a.len() as u32)),
+      },
+      new_text: b.to_string(),
+    }];
   }
   let chunks = diff(a, b);
   let mut text_edits = Vec::<TextEdit>::new();
@@ -259,112 +272,6 @@ pub fn get_edits(a: &str, b: &str, line_index: &LineIndex) -> Vec<TextEdit> {
   }
 
   text_edits
-}
-
-/// Convert a difference between two strings into a change range used by the
-/// TypeScript Language Service.
-pub fn get_range_change(a: &str, b: &str) -> Value {
-  if a == b {
-    return json!(null);
-  }
-  let chunks = diff(a, b);
-  let mut iter = chunks.iter().peekable();
-  let mut started = false;
-  let mut start = 0;
-  let mut end = 0;
-  let mut new_length = 0;
-  let mut equal = 0;
-  let mut a_pos = 0;
-  loop {
-    let diff = iter.next();
-    match diff {
-      None => break,
-      Some(Chunk::Equal(e)) => {
-        a_pos += e.encode_utf16().count();
-        equal += e.encode_utf16().count();
-      }
-      Some(Chunk::Delete(d)) => {
-        if !started {
-          start = a_pos;
-          started = true;
-          equal = 0;
-        }
-        a_pos += d.encode_utf16().count();
-        if started {
-          end = a_pos;
-          new_length += equal;
-          equal = 0;
-        }
-      }
-      Some(Chunk::Insert(i)) => {
-        if !started {
-          start = a_pos;
-          end = a_pos;
-          started = true;
-          equal = 0;
-        } else {
-          end += equal;
-        }
-        new_length += i.encode_utf16().count() + equal;
-        equal = 0;
-      }
-    }
-  }
-
-  json!({
-    "span": {
-      "start": start,
-      "length": end - start,
-    },
-    "newLength": new_length,
-  })
-}
-
-/// Provide a slice of a string based on a character range.
-pub fn slice(s: &str, range: impl RangeBounds<usize>) -> &str {
-  let start = match range.start_bound() {
-    Bound::Included(bound) | Bound::Excluded(bound) => *bound,
-    Bound::Unbounded => 0,
-  };
-  let len = match range.end_bound() {
-    Bound::Included(bound) => *bound + 1,
-    Bound::Excluded(bound) => *bound,
-    Bound::Unbounded => s.encode_utf16().count(),
-  } - start;
-  substring(s, start, start + len)
-}
-
-/// Provide a substring based on the start and end character index positions.
-pub fn substring(s: &str, start: usize, end: usize) -> &str {
-  let len = end - start;
-  let mut char_pos = 0;
-  let mut byte_start = 0;
-  let mut it = s.chars();
-  loop {
-    if char_pos == start {
-      break;
-    }
-    if let Some(c) = it.next() {
-      char_pos += c.len_utf16();
-      byte_start += c.len_utf8();
-    } else {
-      break;
-    }
-  }
-  char_pos = 0;
-  let mut byte_end = byte_start;
-  loop {
-    if char_pos == len {
-      break;
-    }
-    if let Some(c) = it.next() {
-      char_pos += c.len_utf16();
-      byte_end += c.len_utf8();
-    } else {
-      break;
-    }
-  }
-  &s[byte_start..byte_end]
 }
 
 #[cfg(test)]
@@ -636,156 +543,5 @@ const C: char = \"メ メ\";
         },
       ]
     )
-  }
-
-  #[test]
-  fn test_get_range_change() {
-    let a = "abcdefg";
-    let b = "abcdefg";
-    let actual = get_range_change(a, b);
-    assert_eq!(actual, json!(null));
-
-    let a = "abcdefg";
-    let b = "abedcfg";
-    let actual = get_range_change(a, b);
-    assert_eq!(
-      actual,
-      json!({
-        "span": {
-          "start": 2,
-          "length": 3,
-        },
-        "newLength": 3
-      })
-    );
-
-    let a = "abfg";
-    let b = "abcdefg";
-    let actual = get_range_change(a, b);
-    assert_eq!(
-      actual,
-      json!({
-        "span": {
-          "start": 2,
-          "length": 0,
-        },
-        "newLength": 3
-      })
-    );
-
-    let a = "abcdefg";
-    let b = "abfg";
-    let actual = get_range_change(a, b);
-    assert_eq!(
-      actual,
-      json!({
-        "span": {
-          "start": 2,
-          "length": 3,
-        },
-        "newLength": 0
-      })
-    );
-
-    let a = "abcdefg";
-    let b = "abfghij";
-    let actual = get_range_change(a, b);
-    assert_eq!(
-      actual,
-      json!({
-        "span": {
-          "start": 2,
-          "length": 5,
-        },
-        "newLength": 5
-      })
-    );
-
-    let a = "abcdefghijk";
-    let b = "axcxexfxixk";
-    let actual = get_range_change(a, b);
-    assert_eq!(
-      actual,
-      json!({
-        "span": {
-          "start": 1,
-          "length": 9,
-        },
-        "newLength": 9
-      })
-    );
-
-    let a = "abcde";
-    let b = "ab(c)de";
-    let actual = get_range_change(a, b);
-    assert_eq!(
-      actual,
-      json!({
-        "span" : {
-          "start": 2,
-          "length": 1,
-        },
-        "newLength": 3
-      })
-    );
-
-    let a = "hello 🦕!";
-    let b = "hello deno!";
-    let actual = get_range_change(a, b);
-    assert_eq!(
-      actual,
-      json!({
-        "span": {
-          "start": 6,
-          "length": 2,
-        },
-        "newLength": 4
-      })
-    );
-
-    let a = "hello deno!";
-    let b = "hello deno🦕!";
-    let actual = get_range_change(a, b);
-    assert_eq!(
-      actual,
-      json!({
-        "span": {
-          "start": 10,
-          "length": 0,
-        },
-        "newLength": 2
-      })
-    );
-
-    // TODO(@kitsonk): https://github.com/dtolnay/dissimilar/issues/5
-    // let a = r#" 🦕🇺🇸👍 "#;
-    // let b = r#" 🇺🇸👍 "#;
-    // let actual = get_range_change(a, b);
-    // assert_eq!(
-    //   actual,
-    //   json!({
-    //     "span": {
-    //       "start": 1,
-    //       "length": 2,
-    //     },
-    //     "newLength": 0
-    //   })
-    // );
-  }
-
-  #[test]
-  fn test_substring() {
-    assert_eq!(substring("Deno", 1, 3), "en");
-    assert_eq!(substring("y̆y̆", 2, 4), "y̆");
-    assert_eq!(substring("🦕🦕", 2, 4), "🦕");
-  }
-
-  #[test]
-  fn test_slice() {
-    assert_eq!(slice("Deno", 1..3), "en");
-    assert_eq!(slice("Deno", 1..=3), "eno");
-    assert_eq!(slice("Deno Land", 1..), "eno Land");
-    assert_eq!(slice("Deno", ..3), "Den");
-    assert_eq!(slice("Hello 🦕", 6..8), "🦕");
   }
 }

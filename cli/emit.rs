@@ -1,812 +1,470 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-//! The collection of APIs to be able to take `deno_graph` module graphs and
-//! populate a cache, emit files, and transform a graph into the structures for
-//! loading into an isolate.
-
-use crate::ast;
-use crate::cache::CacheType;
-use crate::cache::Cacher;
-use crate::colors;
-use crate::config_file::ConfigFile;
-use crate::config_file::IgnoredCompilerOptions;
-use crate::config_file::TsConfig;
-use crate::diagnostics::Diagnostics;
-use crate::tsc;
-use crate::version;
-
-use deno_ast::swc;
-use deno_core::anyhow::anyhow;
-use deno_core::anyhow::Context;
-use deno_core::error::AnyError;
-use deno_core::serde::Deserialize;
-use deno_core::serde::Deserializer;
-use deno_core::serde::Serialize;
-use deno_core::serde::Serializer;
-use deno_core::serde_json::json;
-use deno_core::serde_json::Value;
-use deno_core::ModuleSpecifier;
-use deno_graph::MediaType;
-use deno_graph::ModuleGraph;
-use deno_graph::ModuleGraphError;
-use deno_graph::ResolutionError;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::fmt;
-use std::rc::Rc;
-use std::result;
 use std::sync::Arc;
-use std::time::Instant;
 
-/// Represents the "default" type library that should be used when type
-/// checking the code in the module graph.  Note that a user provided config
-/// of `"lib"` would override this value.
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
-pub(crate) enum TypeLib {
-  DenoWindow,
-  DenoWorker,
-  UnstableDenoWindow,
-  UnstableDenoWorker,
+use deno_ast::EmittedSourceText;
+use deno_ast::ModuleKind;
+use deno_ast::SourceMapOption;
+use deno_ast::SourceRange;
+use deno_ast::SourceRanged;
+use deno_ast::SourceRangedForSpanned;
+use deno_ast::TranspileModuleOptions;
+use deno_ast::TranspileResult;
+use deno_core::error::AnyError;
+use deno_core::error::CoreError;
+use deno_core::futures::stream::FuturesUnordered;
+use deno_core::futures::FutureExt;
+use deno_core::futures::StreamExt;
+use deno_core::ModuleSpecifier;
+use deno_error::JsErrorBox;
+use deno_graph::MediaType;
+use deno_graph::Module;
+use deno_graph::ModuleGraph;
+use deno_lib::util::hash::FastInsecureHasher;
+
+use crate::args::deno_json::TranspileAndEmitOptions;
+use crate::args::deno_json::TsConfigResolver;
+use crate::cache::EmitCache;
+use crate::cache::ParsedSourceCache;
+use crate::resolver::CliCjsTracker;
+
+#[derive(Debug)]
+pub struct Emitter {
+  cjs_tracker: Arc<CliCjsTracker>,
+  emit_cache: Arc<EmitCache>,
+  parsed_source_cache: Arc<ParsedSourceCache>,
+  tsconfig_resolver: Arc<TsConfigResolver>,
 }
 
-impl Default for TypeLib {
-  fn default() -> Self {
-    Self::DenoWindow
+impl Emitter {
+  pub fn new(
+    cjs_tracker: Arc<CliCjsTracker>,
+    emit_cache: Arc<EmitCache>,
+    parsed_source_cache: Arc<ParsedSourceCache>,
+    tsconfig_resolver: Arc<TsConfigResolver>,
+  ) -> Self {
+    Self {
+      cjs_tracker,
+      emit_cache,
+      parsed_source_cache,
+      tsconfig_resolver,
+    }
   }
-}
 
-impl Serialize for TypeLib {
-  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  where
-    S: Serializer,
-  {
-    let value = match self {
-      Self::DenoWindow => vec!["deno.window".to_string()],
-      Self::DenoWorker => vec!["deno.worker".to_string()],
-      Self::UnstableDenoWindow => {
-        vec!["deno.window".to_string(), "deno.unstable".to_string()]
+  pub async fn cache_module_emits(
+    &self,
+    graph: &ModuleGraph,
+  ) -> Result<(), AnyError> {
+    let mut futures = FuturesUnordered::new();
+    for module in graph.modules() {
+      let Module::Js(module) = module else {
+        continue;
+      };
+
+      if module.media_type.is_emittable() {
+        futures.push(
+          self
+            .emit_parsed_source(
+              &module.specifier,
+              module.media_type,
+              ModuleKind::from_is_cjs(
+                self.cjs_tracker.is_cjs_with_known_is_script(
+                  &module.specifier,
+                  module.media_type,
+                  module.is_script,
+                )?,
+              ),
+              &module.source,
+            )
+            .boxed_local(),
+        );
       }
-      Self::UnstableDenoWorker => {
-        vec!["deno.worker".to_string(), "deno.unstable".to_string()]
-      }
-    };
-    Serialize::serialize(&value, serializer)
-  }
-}
+    }
 
-/// A structure representing stats from an emit operation for a graph.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Stats(pub Vec<(String, u32)>);
-
-impl<'de> Deserialize<'de> for Stats {
-  fn deserialize<D>(deserializer: D) -> result::Result<Self, D::Error>
-  where
-    D: Deserializer<'de>,
-  {
-    let items: Vec<(String, u32)> = Deserialize::deserialize(deserializer)?;
-    Ok(Stats(items))
-  }
-}
-
-impl Serialize for Stats {
-  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  where
-    S: Serializer,
-  {
-    Serialize::serialize(&self.0, serializer)
-  }
-}
-
-impl fmt::Display for Stats {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    writeln!(f, "Compilation statistics:")?;
-    for (key, value) in self.0.clone() {
-      writeln!(f, "  {}: {}", key, value)?;
+    while let Some(result) = futures.next().await {
+      result?; // surface errors
     }
 
     Ok(())
   }
-}
 
-/// An enum that represents the base tsc configuration to return.
-pub(crate) enum ConfigType {
-  /// Return a configuration for bundling, using swc to emit the bundle. This is
-  /// independent of type checking.
-  Bundle,
-  /// Return a configuration to use tsc to type check and optionally emit. This
-  /// is independent of either bundling or just emitting via swc
-  Check { lib: TypeLib, tsc_emit: bool },
-  /// Return a configuration to use swc to emit single module files.
-  Emit,
-  /// Return a configuration as a base for the runtime `Deno.emit()` API.
-  RuntimeEmit { tsc_emit: bool },
-}
-
-/// For a given configuration type and optionally a configuration file, return a
-/// tuple of the resulting `TsConfig` struct and optionally any user
-/// configuration options that were ignored.
-pub(crate) fn get_ts_config(
-  config_type: ConfigType,
-  maybe_config_file: Option<&ConfigFile>,
-  maybe_user_config: Option<&HashMap<String, Value>>,
-) -> Result<(TsConfig, Option<IgnoredCompilerOptions>), AnyError> {
-  let mut ts_config = match config_type {
-    ConfigType::Bundle => TsConfig::new(json!({
-      "checkJs": false,
-      "emitDecoratorMetadata": false,
-      "importsNotUsedAsValues": "remove",
-      "inlineSourceMap": false,
-      "inlineSources": false,
-      "sourceMap": false,
-      "jsx": "react",
-      "jsxFactory": "React.createElement",
-      "jsxFragmentFactory": "React.Fragment",
-    })),
-    ConfigType::Check { tsc_emit, lib } => {
-      let mut ts_config = TsConfig::new(json!({
-        "allowJs": true,
-        "allowSyntheticDefaultImports": true,
-        "experimentalDecorators": true,
-        "incremental": true,
-        "jsx": "react",
-        "isolatedModules": true,
-        "lib": lib,
-        "module": "esnext",
-        "strict": true,
-        "target": "esnext",
-        "tsBuildInfoFile": "deno:///.tsbuildinfo",
-        "useDefineForClassFields": true,
-        // TODO(@kitsonk) remove for Deno 2.0
-        "useUnknownInCatchVariables": false,
-      }));
-      if tsc_emit {
-        ts_config.merge(&json!({
-          "emitDecoratorMetadata": false,
-          "importsNotUsedAsValues": "remove",
-          "inlineSourceMap": true,
-          "inlineSources": true,
-          "outDir": "deno://",
-          "removeComments": true,
-        }));
-      } else {
-        ts_config.merge(&json!({
-          "noEmit": true,
-        }));
-      }
-      ts_config
-    }
-    ConfigType::Emit => TsConfig::new(json!({
-      "checkJs": false,
-      "emitDecoratorMetadata": false,
-      "importsNotUsedAsValues": "remove",
-      "inlineSourceMap": true,
-      "inlineSources": true,
-      "sourceMap": false,
-      "jsx": "react",
-      "jsxFactory": "React.createElement",
-      "jsxFragmentFactory": "React.Fragment",
-    })),
-    ConfigType::RuntimeEmit { tsc_emit } => {
-      let mut ts_config = TsConfig::new(json!({
-        "allowJs": true,
-        "allowSyntheticDefaultImports": true,
-        "checkJs": false,
-        "emitDecoratorMetadata": false,
-        "experimentalDecorators": true,
-        "importsNotUsedAsValues": "remove",
-        "incremental": true,
-        "isolatedModules": true,
-        "jsx": "react",
-        "jsxFactory": "React.createElement",
-        "jsxFragmentFactory": "React.Fragment",
-        "lib": TypeLib::DenoWindow,
-        "module": "esnext",
-        "removeComments": true,
-        "inlineSourceMap": false,
-        "inlineSources": false,
-        "sourceMap": true,
-        "strict": true,
-        "target": "esnext",
-        "tsBuildInfoFile": "deno:///.tsbuildinfo",
-        "useDefineForClassFields": true,
-        // TODO(@kitsonk) remove for Deno 2.0
-        "useUnknownInCatchVariables": false,
-      }));
-      if tsc_emit {
-        ts_config.merge(&json!({
-          "importsNotUsedAsValues": "remove",
-          "outDir": "deno://",
-        }));
-      } else {
-        ts_config.merge(&json!({
-          "noEmit": true,
-        }));
-      }
-      ts_config
-    }
-  };
-  let maybe_ignored_options = if let Some(user_options) = maybe_user_config {
-    ts_config.merge_user_config(user_options)?
-  } else {
-    ts_config.merge_tsconfig_from_config_file(maybe_config_file)?
-  };
-  Ok((ts_config, maybe_ignored_options))
-}
-
-/// Transform the graph into root specifiers that we can feed `tsc`. We have to
-/// provide the media type for root modules because `tsc` does not "resolve" the
-/// media type like other modules, as well as a root specifier needs any
-/// redirects resolved. If we aren't checking JavaScript, we need to include all
-/// the emittable files in the roots, so they get type checked and optionally
-/// emitted, otherwise they would be ignored if only imported into JavaScript.
-fn get_root_names(
-  graph: &ModuleGraph,
-  check_js: bool,
-) -> Vec<(ModuleSpecifier, MediaType)> {
-  if !check_js {
-    graph
-      .specifiers()
-      .into_iter()
-      .filter_map(|(_, r)| match r {
-        Ok((s, mt)) => match &mt {
-          MediaType::TypeScript | MediaType::Tsx | MediaType::Jsx => {
-            Some((s, mt))
-          }
-          _ => None,
-        },
-        _ => None,
-      })
-      .collect()
-  } else {
-    graph
-      .roots
-      .iter()
-      .filter_map(|s| graph.get(s).map(|m| (m.specifier.clone(), m.media_type)))
-      .collect()
-  }
-}
-
-/// A hashing function that takes the source code, version and optionally a
-/// user provided config and generates a string hash which can be stored to
-/// determine if the cached emit is valid or not.
-fn get_version(source_bytes: &[u8], config_bytes: &[u8]) -> String {
-  crate::checksum::gen(&[
-    source_bytes,
-    version::deno().as_bytes(),
-    config_bytes,
-  ])
-}
-
-/// Determine if a given media type is emittable or not.
-fn is_emittable(media_type: &MediaType, include_js: bool) -> bool {
-  match &media_type {
-    MediaType::TypeScript
-    | MediaType::Mts
-    | MediaType::Cts
-    | MediaType::Tsx
-    | MediaType::Jsx => true,
-    MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => include_js,
-    _ => false,
-  }
-}
-
-/// Options for performing a check of a module graph. Note that the decision to
-/// emit or not is determined by the `ts_config` settings.
-pub(crate) struct CheckOptions {
-  /// Set the debug flag on the TypeScript type checker.
-  pub debug: bool,
-  /// If true, any files emitted will be cached, even if there are diagnostics
-  /// produced. If false, if there are diagnostics, caching emitted files will
-  /// be skipped.
-  pub emit_with_diagnostics: bool,
-  /// The module specifier to the configuration file, passed to tsc so that
-  /// configuration related diagnostics are properly formed.
-  pub maybe_config_specifier: Option<ModuleSpecifier>,
-  /// The derived tsconfig that should be used when checking.
-  pub ts_config: TsConfig,
-  /// If true, existing `.tsbuildinfo` files will be ignored.
-  pub reload: bool,
-}
-
-/// The result of a check or emit of a module graph. Note that the actual
-/// emitted sources are stored in the cache and are not returned in the result.
-#[derive(Debug, Default)]
-pub(crate) struct CheckEmitResult {
-  pub diagnostics: Diagnostics,
-  pub stats: Stats,
-}
-
-/// Given a module graph, type check the module graph and optionally emit
-/// modules, updating the cache as appropriate. Emitting is determined by the
-/// `ts_config` supplied in the options, and if emitting, the files are stored
-/// in the cache.
-///
-/// It is expected that it is determined if a check and/or emit is validated
-/// before the function is called.
-pub(crate) fn check_and_maybe_emit(
-  graph: Arc<ModuleGraph>,
-  cache: &mut dyn Cacher,
-  options: CheckOptions,
-) -> Result<CheckEmitResult, AnyError> {
-  let check_js = options.ts_config.get_check_js();
-  let root_names = get_root_names(&graph, check_js);
-  // while there might be multiple roots, we can't "merge" the build info, so we
-  // try to retrieve the build info for first root, which is the most common use
-  // case.
-  let maybe_tsbuildinfo = if options.reload {
-    None
-  } else {
-    cache.get(CacheType::TypeScriptBuildInfo, &graph.roots[0])
-  };
-  // to make tsc build info work, we need to consistently hash modules, so that
-  // tsc can better determine if an emit is still valid or not, so we provide
-  // that data here.
-  let hash_data = vec![
-    options.ts_config.as_bytes(),
-    version::deno().as_bytes().to_owned(),
-  ];
-  let config_bytes = options.ts_config.as_bytes();
-
-  let response = tsc::exec(tsc::Request {
-    config: options.ts_config,
-    debug: options.debug,
-    graph: graph.clone(),
-    hash_data,
-    maybe_config_specifier: options.maybe_config_specifier,
-    maybe_tsbuildinfo,
-    root_names,
-  })?;
-
-  // sometimes we want to emit when there are diagnostics, and sometimes we
-  // don't. tsc will always return an emit if there are diagnostics
-  if (response.diagnostics.is_empty() || options.emit_with_diagnostics)
-    && !response.emitted_files.is_empty()
-  {
-    if let Some(info) = &response.maybe_tsbuildinfo {
-      // while we retrieve the build info for just the first module, it can be
-      // used for all the roots in the graph, so we will cache it for all roots
-      for root in &graph.roots {
-        cache.set(CacheType::TypeScriptBuildInfo, root, info.clone())?;
-      }
-    }
-    for emit in response.emitted_files.into_iter() {
-      if let Some(specifiers) = emit.maybe_specifiers {
-        assert!(specifiers.len() == 1);
-        // The emitted specifier might not be the file specifier we want, so we
-        // resolve it via the graph.
-        let specifier = graph.resolve(&specifiers[0]);
-        let (media_type, source) = if let Some(module) = graph.get(&specifier) {
-          (&module.media_type, module.source.clone())
-        } else {
-          log::debug!("module missing, skipping emit for {}", specifier);
-          continue;
-        };
-        // Sometimes if `tsc` sees a CommonJS file it will _helpfully_ output it
-        // to ESM, which we don't really want to do unless someone has enabled
-        // check_js.
-        if !check_js
-          && matches!(
-            media_type,
-            MediaType::JavaScript | MediaType::Cjs | MediaType::Mjs
-          )
-        {
-          log::debug!("skipping emit for {}", specifier);
-          continue;
-        }
-        match emit.media_type {
-          MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
-            let version = get_version(source.as_bytes(), &config_bytes);
-            cache.set(CacheType::Version, &specifier, version)?;
-            cache.set(CacheType::Emit, &specifier, emit.data)?;
-          }
-          MediaType::SourceMap => {
-            cache.set(CacheType::SourceMap, &specifier, emit.data)?;
-          }
-          // this only occurs with the runtime emit, but we are using the same
-          // code paths, so we handle it here.
-          MediaType::Dts | MediaType::Dcts | MediaType::Dmts => {
-            cache.set(CacheType::Declaration, &specifier, emit.data)?;
-          }
-          _ => unreachable!(),
-        }
-      }
-    }
-  }
-
-  Ok(CheckEmitResult {
-    diagnostics: response.diagnostics,
-    stats: response.stats,
-  })
-}
-
-pub(crate) enum BundleType {
-  /// Return the emitted contents of the program as a single "flattened" ES
-  /// module.
-  Module,
-  /// Return the emitted contents of the program as a single script that
-  /// executes the program using an immediately invoked function execution
-  /// (IIFE).
-  Classic,
-}
-
-impl From<BundleType> for swc::bundler::ModuleType {
-  fn from(bundle_type: BundleType) -> Self {
-    match bundle_type {
-      BundleType::Classic => Self::Iife,
-      BundleType::Module => Self::Es,
-    }
-  }
-}
-
-pub(crate) struct BundleOptions {
-  pub bundle_type: BundleType,
-  pub ts_config: TsConfig,
-}
-
-/// A module loader for swc which does the appropriate retrieval and transpiling
-/// of modules from the graph.
-struct BundleLoader<'a> {
-  cm: Rc<swc::common::SourceMap>,
-  emit_options: &'a ast::EmitOptions,
-  graph: &'a ModuleGraph,
-}
-
-impl swc::bundler::Load for BundleLoader<'_> {
-  fn load(
+  /// Gets a cached emit if the source matches the hash found in the cache.
+  pub fn maybe_cached_emit(
     &self,
-    file_name: &swc::common::FileName,
-  ) -> Result<swc::bundler::ModuleData, AnyError> {
-    match file_name {
-      swc::common::FileName::Url(specifier) => {
-        if let Some(m) = self.graph.get(specifier) {
-          let (fm, module) = ast::transpile_module(
-            specifier,
-            &m.source,
-            m.media_type,
-            self.emit_options,
-            self.cm.clone(),
-          )?;
-          Ok(swc::bundler::ModuleData {
-            fm,
-            module,
-            helpers: Default::default(),
-          })
-        } else {
-          Err(anyhow!(
-            "Module \"{}\" unexpectedly missing when bundling.",
-            specifier
-          ))
-        }
-      }
-      _ => unreachable!(
-        "Received a request for unsupported filename {:?}",
-        file_name
-      ),
-    }
+    specifier: &ModuleSpecifier,
+    module_kind: deno_ast::ModuleKind,
+    source: &str,
+  ) -> Result<Option<String>, AnyError> {
+    let transpile_and_emit_options = self
+      .tsconfig_resolver
+      .transpile_and_emit_options(specifier)?;
+    let source_hash =
+      self.get_source_hash(module_kind, transpile_and_emit_options, source);
+    Ok(self.emit_cache.get_emit_code(specifier, source_hash))
   }
-}
 
-/// A resolver implementation for swc that resolves specifiers from the graph.
-struct BundleResolver<'a>(&'a ModuleGraph);
-
-impl swc::bundler::Resolve for BundleResolver<'_> {
-  fn resolve(
+  pub async fn emit_parsed_source(
     &self,
-    referrer: &swc::common::FileName,
-    specifier: &str,
-  ) -> Result<swc::common::FileName, AnyError> {
-    let referrer = if let swc::common::FileName::Url(referrer) = referrer {
-      referrer
-    } else {
-      unreachable!(
-        "An unexpected referrer was passed when bundling: {:?}",
-        referrer
-      );
-    };
-    if let Some(specifier) =
-      self.0.resolve_dependency(specifier, referrer, false)
-    {
-      Ok(deno_ast::swc::common::FileName::Url(specifier.clone()))
-    } else {
-      Err(anyhow!(
-        "Cannot resolve \"{}\" from \"{}\".",
-        specifier,
-        referrer
-      ))
-    }
-  }
-}
-
-/// Given a module graph, generate and return a bundle of the graph and
-/// optionally its source map. Unlike emitting with `check_and_maybe_emit` and
-/// `emit`, which store the emitted modules in the cache, this function simply
-/// returns the output.
-pub(crate) fn bundle(
-  graph: &ModuleGraph,
-  options: BundleOptions,
-) -> Result<(String, Option<String>), AnyError> {
-  let globals = swc::common::Globals::new();
-  deno_ast::swc::common::GLOBALS.set(&globals, || {
-    let emit_options: ast::EmitOptions = options.ts_config.into();
-    let source_map_config = ast::SourceMapConfig {
-      inline_sources: emit_options.inline_sources,
-    };
-
-    let cm = Rc::new(swc::common::SourceMap::new(
-      swc::common::FilePathMapping::empty(),
-    ));
-    let loader = BundleLoader {
-      graph,
-      emit_options: &emit_options,
-      cm: cm.clone(),
-    };
-    let resolver = BundleResolver(graph);
-    let config = swc::bundler::Config {
-      module: options.bundle_type.into(),
-      ..Default::default()
-    };
-    // This hook will rewrite the `import.meta` when bundling to give a consistent
-    // behavior between bundled and unbundled code.
-    let hook = Box::new(ast::BundleHook);
-    let mut bundler = swc::bundler::Bundler::new(
-      &globals,
-      cm.clone(),
-      loader,
-      resolver,
-      config,
-      hook,
-    );
-    let mut entries = HashMap::new();
-    entries.insert(
-      "bundle".to_string(),
-      swc::common::FileName::Url(graph.roots[0].clone()),
-    );
-    let output = bundler
-      .bundle(entries)
-      .context("Unable to output during bundling.")?;
-    let mut buf = Vec::new();
-    let mut srcmap = Vec::new();
-    {
-      let cfg = swc::codegen::Config { minify: false };
-      let wr = Box::new(swc::codegen::text_writer::JsWriter::new(
-        cm.clone(),
-        "\n",
-        &mut buf,
-        Some(&mut srcmap),
-      ));
-      let mut emitter = swc::codegen::Emitter {
-        cfg,
-        cm: cm.clone(),
-        comments: None,
-        wr,
-      };
-      emitter
-        .emit_module(&output[0].module)
-        .context("Unable to emit during bundling.")?;
-    }
-    let mut code =
-      String::from_utf8(buf).context("Emitted code is an invalid string.")?;
-    let mut maybe_map: Option<String> = None;
-    {
-      let mut buf = Vec::new();
-      cm.build_source_map_with_config(&mut srcmap, None, source_map_config)
-        .to_writer(&mut buf)?;
-      if emit_options.inline_source_map {
-        let encoded_map = format!(
-          "//# sourceMappingURL=data:application/json;base64,{}\n",
-          base64::encode(buf)
+    specifier: &ModuleSpecifier,
+    media_type: MediaType,
+    module_kind: ModuleKind,
+    source: &Arc<str>,
+  ) -> Result<String, EmitParsedSourceHelperError> {
+    let transpile_and_emit_options = self
+      .tsconfig_resolver
+      .transpile_and_emit_options(specifier)?;
+    // Note: keep this in sync with the sync version below
+    let helper = EmitParsedSourceHelper(self);
+    match helper.pre_emit_parsed_source(
+      specifier,
+      module_kind,
+      transpile_and_emit_options,
+      source,
+    ) {
+      PreEmitResult::Cached(emitted_text) => Ok(emitted_text),
+      PreEmitResult::NotCached { source_hash } => {
+        let parsed_source_cache = self.parsed_source_cache.clone();
+        let transpile_and_emit_options = transpile_and_emit_options.clone();
+        let transpiled_source = deno_core::unsync::spawn_blocking({
+          let specifier = specifier.clone();
+          let source = source.clone();
+          move || {
+            EmitParsedSourceHelper::transpile(
+              &parsed_source_cache,
+              &specifier,
+              media_type,
+              module_kind,
+              source.clone(),
+              &transpile_and_emit_options.transpile,
+              &transpile_and_emit_options.emit,
+            )
+            .map(|r| r.text)
+          }
+        })
+        .await
+        .unwrap()?;
+        helper.post_emit_parsed_source(
+          specifier,
+          &transpiled_source,
+          source_hash,
         );
-        code.push_str(&encoded_map);
-      } else if emit_options.source_map {
-        maybe_map = Some(String::from_utf8(buf)?);
+        Ok(transpiled_source)
       }
-    }
-
-    Ok((code, maybe_map))
-  })
-}
-
-pub(crate) struct EmitOptions {
-  pub ts_config: TsConfig,
-  pub reload_exclusions: HashSet<ModuleSpecifier>,
-  pub reload: bool,
-}
-
-/// Given a module graph, emit any appropriate modules and cache them.
-pub(crate) fn emit(
-  graph: &ModuleGraph,
-  cache: &mut dyn Cacher,
-  options: EmitOptions,
-) -> Result<CheckEmitResult, AnyError> {
-  let start = Instant::now();
-  let config_bytes = options.ts_config.as_bytes();
-  let include_js = options.ts_config.get_check_js();
-  let emit_options = options.ts_config.into();
-
-  let mut emit_count = 0_u32;
-  let mut file_count = 0_u32;
-  for module in graph.modules() {
-    file_count += 1;
-    if !is_emittable(&module.media_type, include_js) {
-      continue;
-    }
-    let needs_reload =
-      options.reload && !options.reload_exclusions.contains(&module.specifier);
-    let version = get_version(module.source.as_bytes(), &config_bytes);
-    let is_valid = cache
-      .get(CacheType::Version, &module.specifier)
-      .map_or(false, |v| {
-        v == get_version(module.source.as_bytes(), &config_bytes)
-      });
-    if is_valid && !needs_reload {
-      continue;
-    }
-    let (emit, maybe_map) =
-      ast::transpile(&module.parsed_source, &emit_options)?;
-    emit_count += 1;
-    cache.set(CacheType::Emit, &module.specifier, emit)?;
-    if let Some(map) = maybe_map {
-      cache.set(CacheType::SourceMap, &module.specifier, map)?;
-    }
-    if !is_valid {
-      cache.set(CacheType::Version, &module.specifier, version)?;
     }
   }
 
-  let stats = Stats(vec![
-    ("Files".to_string(), file_count),
-    ("Emitted".to_string(), emit_count),
-    ("Total time".to_string(), start.elapsed().as_millis() as u32),
-  ]);
+  pub fn emit_parsed_source_sync(
+    &self,
+    specifier: &ModuleSpecifier,
+    media_type: MediaType,
+    module_kind: deno_ast::ModuleKind,
+    source: &Arc<str>,
+  ) -> Result<String, EmitParsedSourceHelperError> {
+    let transpile_and_emit_options = self
+      .tsconfig_resolver
+      .transpile_and_emit_options(specifier)?;
+    // Note: keep this in sync with the async version above
+    let helper = EmitParsedSourceHelper(self);
+    match helper.pre_emit_parsed_source(
+      specifier,
+      module_kind,
+      transpile_and_emit_options,
+      source,
+    ) {
+      PreEmitResult::Cached(emitted_text) => Ok(emitted_text),
+      PreEmitResult::NotCached { source_hash } => {
+        let transpiled_source = EmitParsedSourceHelper::transpile(
+          &self.parsed_source_cache,
+          specifier,
+          media_type,
+          module_kind,
+          source.clone(),
+          &transpile_and_emit_options.transpile,
+          &transpile_and_emit_options.emit,
+        )?
+        .text;
+        helper.post_emit_parsed_source(
+          specifier,
+          &transpiled_source,
+          source_hash,
+        );
+        Ok(transpiled_source)
+      }
+    }
+  }
 
-  Ok(CheckEmitResult {
-    diagnostics: Diagnostics::default(),
-    stats,
-  })
-}
+  pub fn emit_parsed_source_for_deno_compile(
+    &self,
+    specifier: &ModuleSpecifier,
+    media_type: MediaType,
+    module_kind: deno_ast::ModuleKind,
+    source: &Arc<str>,
+  ) -> Result<(String, String), AnyError> {
+    let transpile_and_emit_options = self
+      .tsconfig_resolver
+      .transpile_and_emit_options(specifier)?;
+    let mut emit_options = transpile_and_emit_options.emit.clone();
+    emit_options.inline_sources = false;
+    emit_options.source_map = SourceMapOption::Separate;
+    // strip off the path to have more deterministic builds as we don't care
+    // about the source name because we manually provide the source map to v8
+    emit_options.source_map_base = Some(deno_path_util::url_parent(specifier));
+    let source = EmitParsedSourceHelper::transpile(
+      &self.parsed_source_cache,
+      specifier,
+      media_type,
+      module_kind,
+      source.clone(),
+      &transpile_and_emit_options.transpile,
+      &emit_options,
+    )?;
+    Ok((source.text, source.source_map.unwrap()))
+  }
 
-/// Check the sub-resource integrity of a module graph, exiting if the graph is
-/// not valid.
-pub(crate) fn lock(graph: &ModuleGraph) {
-  if let Err(err) = graph.lock() {
-    log::error!("{} {}", colors::red("error:"), err);
-    std::process::exit(10);
+  /// Expects a file URL, panics otherwise.
+  pub async fn load_and_emit_for_hmr(
+    &self,
+    specifier: &ModuleSpecifier,
+  ) -> Result<String, CoreError> {
+    let media_type = MediaType::from_specifier(specifier);
+    let source_code = tokio::fs::read_to_string(
+      ModuleSpecifier::to_file_path(specifier).unwrap(),
+    )
+    .await?;
+    match media_type {
+      MediaType::TypeScript
+      | MediaType::Mts
+      | MediaType::Cts
+      | MediaType::Jsx
+      | MediaType::Tsx => {
+        let source_arc: Arc<str> = source_code.into();
+        let parsed_source = self
+          .parsed_source_cache
+          .remove_or_parse_module(specifier, source_arc, media_type)
+          .map_err(JsErrorBox::from_err)?;
+        // HMR doesn't work with embedded source maps for some reason, so set
+        // the option to not use them (though you should test this out because
+        // this statement is probably wrong)
+        let transpile_and_emit_options = self
+          .tsconfig_resolver
+          .transpile_and_emit_options(specifier)
+          .map_err(JsErrorBox::from_err)?;
+        let mut options = transpile_and_emit_options.emit.clone();
+        options.source_map = SourceMapOption::None;
+        let is_cjs = self
+          .cjs_tracker
+          .is_cjs_with_known_is_script(
+            specifier,
+            media_type,
+            parsed_source.compute_is_script(),
+          )
+          .map_err(JsErrorBox::from_err)?;
+        let transpiled_source = parsed_source
+          .transpile(
+            &transpile_and_emit_options.transpile,
+            &deno_ast::TranspileModuleOptions {
+              module_kind: Some(ModuleKind::from_is_cjs(is_cjs)),
+            },
+            &options,
+          )
+          .map_err(JsErrorBox::from_err)?
+          .into_source();
+        Ok(transpiled_source.text)
+      }
+      MediaType::JavaScript
+      | MediaType::Mjs
+      | MediaType::Cjs
+      | MediaType::Dts
+      | MediaType::Dmts
+      | MediaType::Dcts
+      | MediaType::Json
+      | MediaType::Wasm
+      | MediaType::Css
+      | MediaType::SourceMap
+      | MediaType::Unknown => {
+        // clear this specifier from the parsed source cache as it's now out of date
+        self.parsed_source_cache.free(specifier);
+        Ok(source_code)
+      }
+    }
+  }
+
+  /// A hashing function that takes the source code and uses the global emit
+  /// options then generates a string hash which can be stored to
+  /// determine if the cached emit is valid or not.
+  fn get_source_hash(
+    &self,
+    module_kind: ModuleKind,
+    transpile_and_emit: &TranspileAndEmitOptions,
+    source_text: &str,
+  ) -> u64 {
+    FastInsecureHasher::new_without_deno_version() // stored in the transpile_and_emit_options_hash
+      .write_str(source_text)
+      .write_u64(transpile_and_emit.pre_computed_hash)
+      .write_hashable(module_kind)
+      .finish()
   }
 }
 
-/// Check a module graph to determine if the graph contains anything that
-/// is required to be emitted to be valid. It determines what modules in the
-/// graph are emittable and for those that are emittable, if there is currently
-/// a valid emit in the cache.
-pub(crate) fn valid_emit(
-  graph: &ModuleGraph,
-  cache: &dyn Cacher,
-  ts_config: &TsConfig,
-  reload: bool,
-  reload_exclusions: &HashSet<ModuleSpecifier>,
-) -> bool {
-  let config_bytes = ts_config.as_bytes();
-  let emit_js = ts_config.get_check_js();
-  graph
-    .specifiers()
-    .iter()
-    .filter(|(_, r)| match r {
-      Ok((_, MediaType::TypeScript | MediaType::Mts | MediaType::Cts))
-      | Ok((_, MediaType::Tsx))
-      | Ok((_, MediaType::Jsx)) => true,
-      Ok((_, MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs)) => {
-        emit_js
+enum PreEmitResult {
+  Cached(String),
+  NotCached { source_hash: u64 },
+}
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum EmitParsedSourceHelperError {
+  #[class(inherit)]
+  #[error(transparent)]
+  CompilerOptionsParse(
+    #[from] deno_config::deno_json::CompilerOptionsParseError,
+  ),
+  #[class(inherit)]
+  #[error(transparent)]
+  ParseDiagnostic(#[from] deno_ast::ParseDiagnostic),
+  #[class(inherit)]
+  #[error(transparent)]
+  Transpile(#[from] deno_ast::TranspileError),
+  #[class(inherit)]
+  #[error(transparent)]
+  Other(#[from] JsErrorBox),
+}
+
+/// Helper to share code between async and sync emit_parsed_source methods.
+struct EmitParsedSourceHelper<'a>(&'a Emitter);
+
+impl<'a> EmitParsedSourceHelper<'a> {
+  pub fn pre_emit_parsed_source(
+    &self,
+    specifier: &ModuleSpecifier,
+    module_kind: deno_ast::ModuleKind,
+    transpile_and_emit_options: &TranspileAndEmitOptions,
+    source: &Arc<str>,
+  ) -> PreEmitResult {
+    let source_hash =
+      self
+        .0
+        .get_source_hash(module_kind, transpile_and_emit_options, source);
+
+    if let Some(emit_code) =
+      self.0.emit_cache.get_emit_code(specifier, source_hash)
+    {
+      PreEmitResult::Cached(emit_code)
+    } else {
+      PreEmitResult::NotCached { source_hash }
+    }
+  }
+
+  pub fn transpile(
+    parsed_source_cache: &ParsedSourceCache,
+    specifier: &ModuleSpecifier,
+    media_type: MediaType,
+    module_kind: deno_ast::ModuleKind,
+    source: Arc<str>,
+    transpile_options: &deno_ast::TranspileOptions,
+    emit_options: &deno_ast::EmitOptions,
+  ) -> Result<EmittedSourceText, EmitParsedSourceHelperError> {
+    // nothing else needs the parsed source at this point, so remove from
+    // the cache in order to not transpile owned
+    let parsed_source = parsed_source_cache
+      .remove_or_parse_module(specifier, source, media_type)?;
+    ensure_no_import_assertion(&parsed_source)?;
+    let transpile_result = parsed_source.transpile(
+      transpile_options,
+      &TranspileModuleOptions {
+        module_kind: Some(module_kind),
+      },
+      emit_options,
+    )?;
+    let transpiled_source = match transpile_result {
+      TranspileResult::Owned(source) => source,
+      TranspileResult::Cloned(source) => {
+        debug_assert!(false, "Transpile owned failed.");
+        source
       }
-      _ => false,
-    })
-    .all(|(_, r)| {
-      if let Ok((s, _)) = r {
-        if reload && !reload_exclusions.contains(s) {
-          // we are reloading and the specifier isn't excluded from being
-          // reloaded
-          false
-        } else if let Some(version) = cache.get(CacheType::Version, s) {
-          if let Some(module) = graph.get(s) {
-            version == get_version(module.source.as_bytes(), &config_bytes)
-          } else {
-            // We have a source module in the graph we can't find, so the emit is
-            // clearly wrong
-            false
+    };
+    Ok(transpiled_source)
+  }
+
+  pub fn post_emit_parsed_source(
+    &self,
+    specifier: &ModuleSpecifier,
+    transpiled_source: &str,
+    source_hash: u64,
+  ) {
+    self.0.emit_cache.set_emit_code(
+      specifier,
+      source_hash,
+      transpiled_source.as_bytes(),
+    );
+  }
+}
+
+// todo(dsherret): this is a temporary measure until we have swc erroring for this
+fn ensure_no_import_assertion(
+  parsed_source: &deno_ast::ParsedSource,
+) -> Result<(), JsErrorBox> {
+  fn has_import_assertion(text: &str) -> bool {
+    // good enough
+    text.contains(" assert ") && !text.contains(" with ")
+  }
+
+  fn create_err(
+    parsed_source: &deno_ast::ParsedSource,
+    range: SourceRange,
+  ) -> JsErrorBox {
+    let text_info = parsed_source.text_info_lazy();
+    let loc = text_info.line_and_column_display(range.start);
+    let mut msg = "Import assertions are deprecated. Use `with` keyword, instead of 'assert' keyword.".to_string();
+    msg.push_str("\n\n");
+    msg.push_str(range.text_fast(text_info));
+    msg.push_str("\n\n");
+    msg.push_str(&format!(
+      "  at {}:{}:{}\n",
+      parsed_source.specifier(),
+      loc.line_number,
+      loc.column_number,
+    ));
+    JsErrorBox::generic(msg)
+  }
+
+  let deno_ast::ProgramRef::Module(module) = parsed_source.program_ref() else {
+    return Ok(());
+  };
+
+  for item in &module.body {
+    match item {
+      deno_ast::swc::ast::ModuleItem::ModuleDecl(decl) => match decl {
+        deno_ast::swc::ast::ModuleDecl::Import(n) => {
+          if n.with.is_some()
+            && has_import_assertion(n.text_fast(parsed_source.text_info_lazy()))
+          {
+            return Err(create_err(parsed_source, n.range()));
           }
-        } else {
-          // A module that requires emitting doesn't have a version, so it doesn't
-          // have a valid emit
-          false
         }
-      } else {
-        // Something in the module graph is missing, but that doesn't mean the
-        // emit is invalid
-        true
-      }
-    })
-}
-
-/// An adapter struct to make a deno_graph::ModuleGraphError display as expected
-/// in the Deno CLI.
-#[derive(Debug)]
-pub(crate) struct GraphError(pub ModuleGraphError);
-
-impl std::error::Error for GraphError {}
-
-impl From<ModuleGraphError> for GraphError {
-  fn from(err: ModuleGraphError) -> Self {
-    Self(err)
-  }
-}
-
-impl fmt::Display for GraphError {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match &self.0 {
-      ModuleGraphError::ResolutionError(err) => {
-        if matches!(
-          err,
-          ResolutionError::InvalidDowngrade(_, _)
-            | ResolutionError::InvalidLocalImport(_, _)
-        ) {
-          write!(f, "{}", err.to_string_with_range())
-        } else {
-          self.0.fmt(f)
+        deno_ast::swc::ast::ModuleDecl::ExportAll(n) => {
+          if n.with.is_some()
+            && has_import_assertion(n.text_fast(parsed_source.text_info_lazy()))
+          {
+            return Err(create_err(parsed_source, n.range()));
+          }
         }
-      }
-      _ => self.0.fmt(f),
+        deno_ast::swc::ast::ModuleDecl::ExportNamed(n) => {
+          if n.with.is_some()
+            && has_import_assertion(n.text_fast(parsed_source.text_info_lazy()))
+          {
+            return Err(create_err(parsed_source, n.range()));
+          }
+        }
+        deno_ast::swc::ast::ModuleDecl::ExportDecl(_)
+        | deno_ast::swc::ast::ModuleDecl::ExportDefaultDecl(_)
+        | deno_ast::swc::ast::ModuleDecl::ExportDefaultExpr(_)
+        | deno_ast::swc::ast::ModuleDecl::TsImportEquals(_)
+        | deno_ast::swc::ast::ModuleDecl::TsExportAssignment(_)
+        | deno_ast::swc::ast::ModuleDecl::TsNamespaceExport(_) => {}
+      },
+      deno_ast::swc::ast::ModuleItem::Stmt(_) => {}
     }
   }
-}
 
-/// Convert a module graph to a map of "files", which are used by the runtime
-/// emit to be passed back to the caller.
-pub(crate) fn to_file_map(
-  graph: &ModuleGraph,
-  cache: &dyn Cacher,
-) -> HashMap<String, String> {
-  let mut files = HashMap::new();
-  for (_, result) in graph.specifiers().into_iter() {
-    if let Ok((specifier, media_type)) = result {
-      if let Some(emit) = cache.get(CacheType::Emit, &specifier) {
-        files.insert(format!("{}.js", specifier), emit);
-        if let Some(map) = cache.get(CacheType::SourceMap, &specifier) {
-          files.insert(format!("{}.js.map", specifier), map);
-        }
-      } else if matches!(
-        media_type,
-        MediaType::JavaScript
-          | MediaType::Mjs
-          | MediaType::Cjs
-          | MediaType::Unknown
-      ) {
-        if let Some(module) = graph.get(&specifier) {
-          files.insert(specifier.to_string(), module.source.to_string());
-        }
-      }
-      if let Some(declaration) = cache.get(CacheType::Declaration, &specifier) {
-        files.insert(format!("{}.d.ts", specifier), declaration);
-      }
-    }
-  }
-  files
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn test_is_emittable() {
-    assert!(is_emittable(&MediaType::TypeScript, false));
-    assert!(!is_emittable(&MediaType::Dts, false));
-    assert!(!is_emittable(&MediaType::Dcts, false));
-    assert!(!is_emittable(&MediaType::Dmts, false));
-    assert!(is_emittable(&MediaType::Tsx, false));
-    assert!(!is_emittable(&MediaType::JavaScript, false));
-    assert!(!is_emittable(&MediaType::Cjs, false));
-    assert!(!is_emittable(&MediaType::Mjs, false));
-    assert!(is_emittable(&MediaType::JavaScript, true));
-    assert!(is_emittable(&MediaType::Jsx, false));
-    assert!(!is_emittable(&MediaType::Json, false));
-  }
+  Ok(())
 }
