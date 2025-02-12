@@ -1,6 +1,9 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_core::error::AnyError;
+use std::borrow::Cow;
+use std::rc::Rc;
+
+use deno_core::futures::TryFutureExt;
 use deno_core::AsyncMutFuture;
 use deno_core::AsyncRefCell;
 use deno_core::AsyncResult;
@@ -8,15 +11,13 @@ use deno_core::CancelHandle;
 use deno_core::CancelTryFuture;
 use deno_core::RcRef;
 use deno_core::Resource;
-use deno_core::ZeroCopyBuf;
-use std::borrow::Cow;
-use std::rc::Rc;
+use deno_error::JsErrorBox;
+use socket2::SockRef;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp;
-
 #[cfg(unix)]
 use tokio::net::unix;
 
@@ -67,54 +68,84 @@ where
 
   pub async fn read(
     self: Rc<Self>,
-    mut buf: ZeroCopyBuf,
-  ) -> Result<usize, AnyError> {
+    data: &mut [u8],
+  ) -> Result<usize, std::io::Error> {
     let mut rd = self.rd_borrow_mut().await;
-    let nread = rd
-      .read(&mut buf)
-      .try_or_cancel(self.cancel_handle())
-      .await?;
+    let nread = rd.read(data).try_or_cancel(self.cancel_handle()).await?;
     Ok(nread)
   }
 
   pub async fn write(
     self: Rc<Self>,
-    buf: ZeroCopyBuf,
-  ) -> Result<usize, AnyError> {
+    data: &[u8],
+  ) -> Result<usize, std::io::Error> {
     let mut wr = self.wr_borrow_mut().await;
-    let nwritten = wr.write(&buf).await?;
+    let nwritten = wr.write(data).await?;
     Ok(nwritten)
   }
 
-  pub async fn shutdown(self: Rc<Self>) -> Result<(), AnyError> {
+  pub async fn shutdown(self: Rc<Self>) -> Result<(), std::io::Error> {
     let mut wr = self.wr_borrow_mut().await;
     wr.shutdown().await?;
     Ok(())
   }
 }
 
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum MapError {
+  #[class(inherit)]
+  #[error("{0}")]
+  Io(std::io::Error),
+  #[class(generic)]
+  #[error("Unable to get resources")]
+  NoResources,
+}
+
 pub type TcpStreamResource =
   FullDuplexResource<tcp::OwnedReadHalf, tcp::OwnedWriteHalf>;
 
 impl Resource for TcpStreamResource {
+  deno_core::impl_readable_byob!();
+  deno_core::impl_writable!();
+
   fn name(&self) -> Cow<str> {
     "tcpStream".into()
   }
 
-  fn read(self: Rc<Self>, buf: ZeroCopyBuf) -> AsyncResult<usize> {
-    Box::pin(self.read(buf))
-  }
-
-  fn write(self: Rc<Self>, buf: ZeroCopyBuf) -> AsyncResult<usize> {
-    Box::pin(self.write(buf))
-  }
-
   fn shutdown(self: Rc<Self>) -> AsyncResult<()> {
-    Box::pin(self.shutdown())
+    Box::pin(self.shutdown().map_err(JsErrorBox::from_err))
   }
 
   fn close(self: Rc<Self>) {
     self.cancel_read_ops();
+  }
+}
+
+impl TcpStreamResource {
+  pub fn set_nodelay(self: Rc<Self>, nodelay: bool) -> Result<(), MapError> {
+    self.map_socket(Box::new(move |socket| socket.set_nodelay(nodelay)))
+  }
+
+  pub fn set_keepalive(
+    self: Rc<Self>,
+    keepalive: bool,
+  ) -> Result<(), MapError> {
+    self.map_socket(Box::new(move |socket| socket.set_keepalive(keepalive)))
+  }
+
+  #[allow(clippy::type_complexity)]
+  fn map_socket(
+    self: Rc<Self>,
+    map: Box<dyn FnOnce(SockRef) -> Result<(), std::io::Error>>,
+  ) -> Result<(), MapError> {
+    if let Some(wr) = RcRef::map(self, |r| &r.wr).try_borrow() {
+      let stream = wr.as_ref().as_ref();
+      let socket = socket2::SockRef::from(stream);
+
+      return map(socket).map_err(MapError::Io);
+    }
+
+    Err(MapError::NoResources)
   }
 }
 
@@ -127,19 +158,14 @@ pub struct UnixStreamResource;
 
 #[cfg(not(unix))]
 impl UnixStreamResource {
-  pub async fn read(
-    self: Rc<Self>,
-    _buf: ZeroCopyBuf,
-  ) -> Result<usize, AnyError> {
+  fn read(self: Rc<Self>, _data: &mut [u8]) -> AsyncResult<usize> {
     unreachable!()
   }
-  pub async fn write(
-    self: Rc<Self>,
-    _buf: ZeroCopyBuf,
-  ) -> Result<usize, AnyError> {
+  fn write(self: Rc<Self>, _data: &[u8]) -> AsyncResult<usize> {
     unreachable!()
   }
-  pub async fn shutdown(self: Rc<Self>) -> Result<(), AnyError> {
+  #[allow(clippy::unused_async)]
+  pub async fn shutdown(self: Rc<Self>) -> Result<(), JsErrorBox> {
     unreachable!()
   }
   pub fn cancel_read_ops(&self) {
@@ -148,20 +174,15 @@ impl UnixStreamResource {
 }
 
 impl Resource for UnixStreamResource {
+  deno_core::impl_readable_byob!();
+  deno_core::impl_writable!();
+
   fn name(&self) -> Cow<str> {
     "unixStream".into()
   }
 
-  fn read(self: Rc<Self>, buf: ZeroCopyBuf) -> AsyncResult<usize> {
-    Box::pin(self.read(buf))
-  }
-
-  fn write(self: Rc<Self>, buf: ZeroCopyBuf) -> AsyncResult<usize> {
-    Box::pin(self.write(buf))
-  }
-
   fn shutdown(self: Rc<Self>) -> AsyncResult<()> {
-    Box::pin(self.shutdown())
+    Box::pin(self.shutdown().map_err(JsErrorBox::from_err))
   }
 
   fn close(self: Rc<Self>) {

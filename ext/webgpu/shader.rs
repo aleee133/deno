@@ -1,51 +1,49 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_core::error::AnyError;
-use deno_core::ResourceId;
-use deno_core::{OpState, Resource};
-use serde::Deserialize;
-use std::borrow::Cow;
+use deno_core::op2;
+use deno_core::webidl::WebIdlInterfaceConverter;
+use deno_core::GarbageCollected;
+use deno_core::WebIDL;
 
-use super::error::WebGpuResult;
+use crate::Instance;
 
-pub(crate) struct WebGpuShaderModule(pub(crate) wgpu_core::id::ShaderModuleId);
-impl Resource for WebGpuShaderModule {
-  fn name(&self) -> Cow<str> {
-    "webGPUShaderModule".into()
+pub struct GPUShaderModule {
+  pub instance: Instance,
+  pub id: wgpu_core::id::ShaderModuleId,
+  pub label: String,
+}
+
+impl Drop for GPUShaderModule {
+  fn drop(&mut self) {
+    self.instance.shader_module_drop(self.id);
   }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateShaderModuleArgs {
-  device_rid: ResourceId,
-  label: Option<String>,
-  code: String,
-  _source_map: Option<()>, // not yet implemented
+impl WebIdlInterfaceConverter for GPUShaderModule {
+  const NAME: &'static str = "GPUShaderModule";
 }
 
-pub fn op_webgpu_create_shader_module(
-  state: &mut OpState,
-  args: CreateShaderModuleArgs,
-  _: (),
-) -> Result<WebGpuResult, AnyError> {
-  let instance = state.borrow::<super::Instance>();
-  let device_resource = state
-    .resource_table
-    .get::<super::WebGpuDevice>(args.device_rid)?;
-  let device = device_resource.0;
+impl GarbageCollected for GPUShaderModule {}
 
-  let source =
-    wgpu_core::pipeline::ShaderModuleSource::Wgsl(Cow::from(args.code));
+#[op2]
+impl GPUShaderModule {
+  #[getter]
+  #[string]
+  fn label(&self) -> String {
+    self.label.clone()
+  }
+  #[setter]
+  #[string]
+  fn label(&self, #[webidl] _label: String) {
+    // TODO(@crowlKats): no-op, needs wpgu to implement changing the label
+  }
+}
 
-  let descriptor = wgpu_core::pipeline::ShaderModuleDescriptor {
-    label: args.label.map(Cow::from),
-  };
+#[derive(WebIDL)]
+#[webidl(dictionary)]
+pub(crate) struct GPUShaderModuleDescriptor {
+  #[webidl(default = String::new())]
+  pub label: String,
 
-  gfx_put!(device => instance.device_create_shader_module(
-    device,
-    &descriptor,
-    source,
-    std::marker::PhantomData
-  ) => state, WebGpuShaderModule)
+  pub code: String,
 }

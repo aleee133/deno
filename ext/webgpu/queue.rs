@@ -1,142 +1,165 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use std::num::NonZeroU32;
+use deno_core::cppgc::Ptr;
+use deno_core::op2;
+use deno_core::GarbageCollected;
+use deno_core::WebIDL;
+use deno_error::JsErrorBox;
 
-use deno_core::error::AnyError;
-use deno_core::OpState;
-use deno_core::ResourceId;
-use deno_core::ZeroCopyBuf;
-use serde::Deserialize;
+use crate::buffer::GPUBuffer;
+use crate::command_buffer::GPUCommandBuffer;
+use crate::texture::GPUTexture;
+use crate::texture::GPUTextureAspect;
+use crate::webidl::GPUExtent3D;
+use crate::webidl::GPUOrigin3D;
+use crate::Instance;
 
-use super::error::WebGpuResult;
+pub struct GPUQueue {
+  pub instance: Instance,
+  pub error_handler: super::error::ErrorHandler,
 
-type WebGpuQueue = super::WebGpuDevice;
+  pub label: String,
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueueSubmitArgs {
-  queue_rid: ResourceId,
-  command_buffers: Vec<ResourceId>,
+  pub id: wgpu_core::id::QueueId,
 }
 
-pub fn op_webgpu_queue_submit(
-  state: &mut OpState,
-  args: QueueSubmitArgs,
-  _: (),
-) -> Result<WebGpuResult, AnyError> {
-  let instance = state.borrow::<super::Instance>();
-  let queue_resource =
-    state.resource_table.get::<WebGpuQueue>(args.queue_rid)?;
-  let queue = queue_resource.0;
+impl Drop for GPUQueue {
+  fn drop(&mut self) {
+    self.instance.queue_drop(self.id);
+  }
+}
 
-  let mut ids = vec![];
+impl GarbageCollected for GPUQueue {}
 
-  for rid in args.command_buffers {
-    let buffer_resource =
-      state
-        .resource_table
-        .get::<super::command_encoder::WebGpuCommandBuffer>(rid)?;
-    ids.push(buffer_resource.0);
+#[op2]
+impl GPUQueue {
+  #[getter]
+  #[string]
+  fn label(&self) -> String {
+    self.label.clone()
+  }
+  #[setter]
+  #[string]
+  fn label(&self, #[webidl] _label: String) {
+    // TODO(@crowlKats): no-op, needs wpgu to implement changing the label
   }
 
-  let maybe_err =
-    gfx_select!(queue => instance.queue_submit(queue, &ids)).err();
+  #[required(1)]
+  fn submit(
+    &self,
+    #[webidl] command_buffers: Vec<Ptr<GPUCommandBuffer>>,
+  ) -> Result<(), JsErrorBox> {
+    let ids = command_buffers
+      .into_iter()
+      .enumerate()
+      .map(|(i, cb)| {
+        if cb.consumed.set(()).is_err() {
+          Err(JsErrorBox::type_error(format!(
+            "The command buffer at position {i} has already been submitted."
+          )))
+        } else {
+          Ok(cb.id)
+        }
+      })
+      .collect::<Result<Vec<_>, _>>()?;
 
-  Ok(WebGpuResult::maybe_err(maybe_err))
-}
+    let err = self.instance.queue_submit(self.id, &ids).err();
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GpuImageDataLayout {
-  offset: u64,
-  bytes_per_row: Option<u32>,
-  rows_per_image: Option<u32>,
-}
-
-impl From<GpuImageDataLayout> for wgpu_types::ImageDataLayout {
-  fn from(layout: GpuImageDataLayout) -> Self {
-    wgpu_types::ImageDataLayout {
-      offset: layout.offset,
-      bytes_per_row: NonZeroU32::new(layout.bytes_per_row.unwrap_or(0)),
-      rows_per_image: NonZeroU32::new(layout.rows_per_image.unwrap_or(0)),
+    if let Some((_, err)) = err {
+      self.error_handler.push_error(Some(err));
     }
+
+    Ok(())
+  }
+
+  #[async_method]
+  async fn on_submitted_work_done(&self) -> Result<(), JsErrorBox> {
+    Err(JsErrorBox::generic(
+      "This operation is currently not supported",
+    ))
+  }
+
+  #[required(3)]
+  fn write_buffer(
+    &self,
+    #[webidl] buffer: Ptr<GPUBuffer>,
+    #[webidl(options(enforce_range = true))] buffer_offset: u64,
+    #[anybuffer] buf: &[u8],
+    #[webidl(default = 0, options(enforce_range = true))] data_offset: u64,
+    #[webidl(options(enforce_range = true))] size: Option<u64>,
+  ) {
+    let data = match size {
+      Some(size) => {
+        &buf[(data_offset as usize)..((data_offset + size) as usize)]
+      }
+      None => &buf[(data_offset as usize)..],
+    };
+
+    let err = self
+      .instance
+      .queue_write_buffer(self.id, buffer.id, buffer_offset, data)
+      .err();
+
+    self.error_handler.push_error(err);
+  }
+
+  #[required(4)]
+  fn write_texture(
+    &self,
+    #[webidl] destination: GPUTexelCopyTextureInfo,
+    #[anybuffer] buf: &[u8],
+    #[webidl] data_layout: GPUTexelCopyBufferLayout,
+    #[webidl] size: GPUExtent3D,
+  ) {
+    let destination = wgpu_core::command::TexelCopyTextureInfo {
+      texture: destination.texture.id,
+      mip_level: destination.mip_level,
+      origin: destination.origin.into(),
+      aspect: destination.aspect.into(),
+    };
+
+    let data_layout = wgpu_types::TexelCopyBufferLayout {
+      offset: data_layout.offset,
+      bytes_per_row: data_layout.bytes_per_row,
+      rows_per_image: data_layout.rows_per_image,
+    };
+
+    let err = self
+      .instance
+      .queue_write_texture(
+        self.id,
+        &destination,
+        buf,
+        &data_layout,
+        &size.into(),
+      )
+      .err();
+
+    self.error_handler.push_error(err);
   }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueueWriteBufferArgs {
-  queue_rid: ResourceId,
-  buffer: ResourceId,
-  buffer_offset: u64,
-  data_offset: usize,
-  size: Option<usize>,
+#[derive(WebIDL)]
+#[webidl(dictionary)]
+pub(crate) struct GPUTexelCopyTextureInfo {
+  pub texture: Ptr<GPUTexture>,
+  #[webidl(default = 0)]
+  #[options(enforce_range = true)]
+  pub mip_level: u32,
+  #[webidl(default = Default::default())]
+  pub origin: GPUOrigin3D,
+  #[webidl(default = GPUTextureAspect::All)]
+  pub aspect: GPUTextureAspect,
 }
 
-pub fn op_webgpu_write_buffer(
-  state: &mut OpState,
-  args: QueueWriteBufferArgs,
-  zero_copy: ZeroCopyBuf,
-) -> Result<WebGpuResult, AnyError> {
-  let instance = state.borrow::<super::Instance>();
-  let buffer_resource = state
-    .resource_table
-    .get::<super::buffer::WebGpuBuffer>(args.buffer)?;
-  let buffer = buffer_resource.0;
-  let queue_resource =
-    state.resource_table.get::<WebGpuQueue>(args.queue_rid)?;
-  let queue = queue_resource.0;
-
-  let data = match args.size {
-    Some(size) => &zero_copy[args.data_offset..(args.data_offset + size)],
-    None => &zero_copy[args.data_offset..],
-  };
-  let maybe_err = gfx_select!(queue => instance.queue_write_buffer(
-    queue,
-    buffer,
-    args.buffer_offset,
-    data
-  ))
-  .err();
-
-  Ok(WebGpuResult::maybe_err(maybe_err))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueueWriteTextureArgs {
-  queue_rid: ResourceId,
-  destination: super::command_encoder::GpuImageCopyTexture,
-  data_layout: GpuImageDataLayout,
-  size: super::texture::GpuExtent3D,
-}
-
-pub fn op_webgpu_write_texture(
-  state: &mut OpState,
-  args: QueueWriteTextureArgs,
-  zero_copy: ZeroCopyBuf,
-) -> Result<WebGpuResult, AnyError> {
-  let instance = state.borrow::<super::Instance>();
-  let texture_resource = state
-    .resource_table
-    .get::<super::texture::WebGpuTexture>(args.destination.texture)?;
-  let queue_resource =
-    state.resource_table.get::<WebGpuQueue>(args.queue_rid)?;
-  let queue = queue_resource.0;
-
-  let destination = wgpu_core::command::ImageCopyTexture {
-    texture: texture_resource.0,
-    mip_level: args.destination.mip_level,
-    origin: args.destination.origin.into(),
-    aspect: args.destination.aspect.into(),
-  };
-  let data_layout = args.data_layout.into();
-
-  gfx_ok!(queue => instance.queue_write_texture(
-    queue,
-    &destination,
-    &*zero_copy,
-    &data_layout,
-    &args.size.into()
-  ))
+#[derive(WebIDL)]
+#[webidl(dictionary)]
+struct GPUTexelCopyBufferLayout {
+  #[webidl(default = 0)]
+  #[options(enforce_range = true)]
+  offset: u64,
+  #[options(enforce_range = true)]
+  bytes_per_row: Option<u32>,
+  #[options(enforce_range = true)]
+  rows_per_image: Option<u32>,
 }
